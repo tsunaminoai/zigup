@@ -352,6 +352,23 @@ pub fn runCompiler(allocator: Allocator, args: []const []const u8) !u8 {
 
 const SetDefault = enum { set_default, leave_default };
 
+fn fetchZLS(allocator: Allocator, version_arg: []const u8, install_dir: []const u8) !void {
+    var optional_download_index: ?ZLSIndex = null;
+
+    const ZLSUrl = struct { version: []const u8, arch: []const u8 = json_platform, url: []const u8 };
+
+    const is_master = std.mem.eql(u8, version_arg, "master");
+    const version_url = blk: {
+        if (!is_master)
+            break :blk ZLSUrl{ .version = version_arg, .url = try getZLSUrl(allocator, version_arg) };
+        optional_download_index = try fetchZLSIndex(allocator);
+        const latest = optional_download_index.?.json.value.object.get("latest").?;
+        break :blk ZLSUrl{ .version = version_arg, .url = try getZLSUrl(allocator, latest.string) };
+    };
+
+    try InstallZLS(allocator, install_dir, version_url.url);
+}
+
 fn fetchCompiler(allocator: Allocator, version_arg: []const u8, set_default: SetDefault) !void {
     const install_dir = try getInstallDir(allocator, .{ .create = true });
     defer allocator.free(install_dir);
@@ -380,6 +397,7 @@ fn fetchCompiler(allocator: Allocator, version_arg: []const u8, set_default: Set
     const compiler_dir = try std.fs.path.join(allocator, &[_][]const u8{ install_dir, version_url.version });
     defer allocator.free(compiler_dir);
     try installCompiler(allocator, compiler_dir, version_url.url);
+    try fetchZLS(allocator, version_arg, compiler_dir);
     if (is_master) {
         const master_symlink = try std.fs.path.join(allocator, &[_][]const u8{ install_dir, "master" });
         defer allocator.free(master_symlink);
@@ -394,6 +412,31 @@ fn fetchCompiler(allocator: Allocator, version_arg: []const u8, set_default: Set
     if (set_default == .set_default) {
         try setDefaultCompiler(allocator, compiler_dir, .existence_verified);
     }
+}
+
+const zls_index_url = "https://zigtools-releases.nyc3.digitaloceanspaces.com/zls/index.json";
+const zls_fetch_url = "https://zigtools-releases.nyc3.digitaloceanspaces.com/zls/{s}/{s}/zls";
+
+const ZLSIndex = struct {
+    text: []u8,
+    json: std.json.Parsed(std.json.Value),
+    pub fn deinit(self: *ZLSIndex, allocator: Allocator) void {
+        self.json.deinit();
+        allocator.free(self.text);
+    }
+};
+
+fn fetchZLSIndex(allocator: Allocator) !ZLSIndex {
+    const text = downloadToString(allocator, download_index_url) catch |e| switch (e) {
+        else => {
+            std.log.err("failed to download '{s}': {}", .{ download_index_url, e });
+            return e;
+        },
+    };
+    errdefer allocator.free(text);
+    var json = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    errdefer json.deinit();
+    return ZLSIndex{ .text = text, .json = json };
 }
 
 const download_index_url = "https://ziglang.org/download/index.json";
@@ -882,6 +925,17 @@ fn getDefaultUrl(allocator: Allocator, compiler_version: []const u8) ![]const u8
         .dev => try std.fmt.allocPrint(allocator, "https://ziglang.org/builds/zig-" ++ url_platform ++ "-{0s}." ++ archive_ext, .{compiler_version}),
         .release => try std.fmt.allocPrint(allocator, "https://ziglang.org/download/{s}/zig-" ++ url_platform ++ "-{0s}." ++ archive_ext, .{compiler_version}),
     };
+}
+
+fn getZLSUrl(allocator: Allocator, compiler_version: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, zls_fetch_url, .{ compiler_version, json_platform });
+}
+
+fn InstallZLS(allocator: Allocator, install_dir: []const u8, url: []const u8) !void {
+    const zls_absolute = try std.fs.path.join(allocator, &[_][]const u8{ install_dir, "zls" });
+    defer allocator.free(zls_absolute);
+    loginfo("downloading '{s}' to '{s}'", .{ url, zls_absolute });
+    try downloadToFileAbsolute(allocator, url, zls_absolute);
 }
 
 fn installCompiler(allocator: Allocator, compiler_dir: []const u8, url: []const u8) !void {
